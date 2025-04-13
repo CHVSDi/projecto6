@@ -1,395 +1,456 @@
-from __future__ import annotations
+import functools
+import logging
+import os
+import pathlib
+import sys
+import sysconfig
+from typing import Any, Dict, Generator, Optional, Tuple
 
-import collections.abc as cabc
-import string
-import typing as t
+from pip._internal.models.scheme import SCHEME_KEYS, Scheme
+from pip._internal.utils.compat import WINDOWS
+from pip._internal.utils.deprecation import deprecated
+from pip._internal.utils.virtualenv import running_under_virtualenv
 
-try:
-    from ._speedups import _escape_inner
-except ImportError:
-    from ._native import _escape_inner
+from . import _sysconfig
+from .base import (
+    USER_CACHE_DIR,
+    get_major_minor_version,
+    get_src_prefix,
+    is_osx_framework,
+    site_packages,
+    user_site,
+)
 
-if t.TYPE_CHECKING:
-    import typing_extensions as te
+__all__ = [
+    "USER_CACHE_DIR",
+    "get_bin_prefix",
+    "get_bin_user",
+    "get_major_minor_version",
+    "get_platlib",
+    "get_purelib",
+    "get_scheme",
+    "get_src_prefix",
+    "site_packages",
+    "user_site",
+]
 
 
-class _HasHTML(t.Protocol):
-    def __html__(self, /) -> str: ...
+logger = logging.getLogger(__name__)
 
 
-class _TPEscape(t.Protocol):
-    def __call__(self, s: t.Any, /) -> Markup: ...
+_PLATLIBDIR: str = getattr(sys, "platlibdir", "lib")
+
+_USE_SYSCONFIG_DEFAULT = sys.version_info >= (3, 10)
 
 
-def escape(s: t.Any, /) -> Markup:
-    """Replace the characters ``&``, ``<``, ``>``, ``'``, and ``"`` in
-    the string with HTML-safe sequences. Use this if you need to display
-    text that might contain such characters in HTML.
+def _should_use_sysconfig() -> bool:
+    """This function determines the value of _USE_SYSCONFIG.
 
-    If the object has an ``__html__`` method, it is called and the
-    return value is assumed to already be safe for HTML.
+    By default, pip uses sysconfig on Python 3.10+.
+    But Python distributors can override this decision by setting:
+        sysconfig._PIP_USE_SYSCONFIG = True / False
+    Rationale in https://github.com/pypa/pip/issues/10647
 
-    :param s: An object to be converted to a string and escaped.
-    :return: A :class:`Markup` string with the escaped text.
+    This is a function for testability, but should be constant during any one
+    run.
     """
-    # If the object is already a plain string, skip __html__ check and string
-    # conversion. This is the most common use case.
-    # Use type(s) instead of s.__class__ because a proxy object may be reporting
-    # the __class__ of the proxied value.
-    if type(s) is str:
-        return Markup(_escape_inner(s))
-
-    if hasattr(s, "__html__"):
-        return Markup(s.__html__())
-
-    return Markup(_escape_inner(str(s)))
+    return bool(getattr(sysconfig, "_PIP_USE_SYSCONFIG", _USE_SYSCONFIG_DEFAULT))
 
 
-def escape_silent(s: t.Any | None, /) -> Markup:
-    """Like :func:`escape` but treats ``None`` as the empty string.
-    Useful with optional values, as otherwise you get the string
-    ``'None'`` when the value is ``None``.
+_USE_SYSCONFIG = _should_use_sysconfig()
 
-    >>> escape(None)
-    Markup('None')
-    >>> escape_silent(None)
-    Markup('')
+if not _USE_SYSCONFIG:
+    # Import distutils lazily to avoid deprecation warnings,
+    # but import it soon enough that it is in memory and available during
+    # a pip reinstall.
+    from . import _distutils
+
+# Be noisy about incompatibilities if this platforms "should" be using
+# sysconfig, but is explicitly opting out and using distutils instead.
+if _USE_SYSCONFIG_DEFAULT and not _USE_SYSCONFIG:
+    _MISMATCH_LEVEL = logging.WARNING
+else:
+    _MISMATCH_LEVEL = logging.DEBUG
+
+
+def _looks_like_bpo_44860() -> bool:
+    """The resolution to bpo-44860 will change this incorrect platlib.
+
+    See <https://bugs.python.org/issue44860>.
     """
-    if s is None:
-        return Markup()
+    from distutils.command.install import INSTALL_SCHEMES
 
-    return escape(s)
+    try:
+        unix_user_platlib = INSTALL_SCHEMES["unix_user"]["platlib"]
+    except KeyError:
+        return False
+    return unix_user_platlib == "$usersite"
 
 
-def soft_str(s: t.Any, /) -> str:
-    """Convert an object to a string if it isn't already. This preserves
-    a :class:`Markup` string rather than converting it back to a basic
-    string, so it will still be marked as safe and won't be escaped
-    again.
+def _looks_like_red_hat_patched_platlib_purelib(scheme: Dict[str, str]) -> bool:
+    platlib = scheme["platlib"]
+    if "/$platlibdir/" in platlib:
+        platlib = platlib.replace("/$platlibdir/", f"/{_PLATLIBDIR}/")
+    if "/lib64/" not in platlib:
+        return False
+    unpatched = platlib.replace("/lib64/", "/lib/")
+    return unpatched.replace("$platbase/", "$base/") == scheme["purelib"]
 
-    >>> value = escape("<User 1>")
-    >>> value
-    Markup('&lt;User 1&gt;')
-    >>> escape(str(value))
-    Markup('&amp;lt;User 1&amp;gt;')
-    >>> escape(soft_str(value))
-    Markup('&lt;User 1&gt;')
+
+@functools.lru_cache(maxsize=None)
+def _looks_like_red_hat_lib() -> bool:
+    """Red Hat patches platlib in unix_prefix and unix_home, but not purelib.
+
+    This is the only way I can see to tell a Red Hat-patched Python.
     """
-    if not isinstance(s, str):
-        return str(s)
+    from distutils.command.install import INSTALL_SCHEMES
 
-    return s
+    return all(
+        k in INSTALL_SCHEMES
+        and _looks_like_red_hat_patched_platlib_purelib(INSTALL_SCHEMES[k])
+        for k in ("unix_prefix", "unix_home")
+    )
 
 
-class Markup(str):
-    """A string that is ready to be safely inserted into an HTML or XML
-    document, either because it was escaped or because it was marked
-    safe.
+@functools.lru_cache(maxsize=None)
+def _looks_like_debian_scheme() -> bool:
+    """Debian adds two additional schemes."""
+    from distutils.command.install import INSTALL_SCHEMES
 
-    Passing an object to the constructor converts it to text and wraps
-    it to mark it safe without escaping. To escape the text, use the
-    :meth:`escape` class method instead.
+    return "deb_system" in INSTALL_SCHEMES and "unix_local" in INSTALL_SCHEMES
 
-    >>> Markup("Hello, <em>World</em>!")
-    Markup('Hello, <em>World</em>!')
-    >>> Markup(42)
-    Markup('42')
-    >>> Markup.escape("Hello, <em>World</em>!")
-    Markup('Hello &lt;em&gt;World&lt;/em&gt;!')
 
-    This implements the ``__html__()`` interface that some frameworks
-    use. Passing an object that implements ``__html__()`` will wrap the
-    output of that method, marking it safe.
+@functools.lru_cache(maxsize=None)
+def _looks_like_red_hat_scheme() -> bool:
+    """Red Hat patches ``sys.prefix`` and ``sys.exec_prefix``.
 
-    >>> class Foo:
-    ...     def __html__(self):
-    ...         return '<a href="/foo">foo</a>'
-    ...
-    >>> Markup(Foo())
-    Markup('<a href="/foo">foo</a>')
-
-    This is a subclass of :class:`str`. It has the same methods, but
-    escapes their arguments and returns a ``Markup`` instance.
-
-    >>> Markup("<em>%s</em>") % ("foo & bar",)
-    Markup('<em>foo &amp; bar</em>')
-    >>> Markup("<em>Hello</em> ") + "<foo>"
-    Markup('<em>Hello</em> &lt;foo&gt;')
+    Red Hat's ``00251-change-user-install-location.patch`` changes the install
+    command's ``prefix`` and ``exec_prefix`` to append ``"/local"``. This is
+    (fortunately?) done quite unconditionally, so we create a default command
+    object without any configuration to detect this.
     """
-
-    __slots__ = ()
-
-    def __new__(
-        cls, object: t.Any = "", encoding: str | None = None, errors: str = "strict"
-    ) -> te.Self:
-        if hasattr(object, "__html__"):
-            object = object.__html__()
-
-        if encoding is None:
-            return super().__new__(cls, object)
-
-        return super().__new__(cls, object, encoding, errors)
-
-    def __html__(self, /) -> te.Self:
-        return self
-
-    def __add__(self, value: str | _HasHTML, /) -> te.Self:
-        if isinstance(value, str) or hasattr(value, "__html__"):
-            return self.__class__(super().__add__(self.escape(value)))
-
-        return NotImplemented
-
-    def __radd__(self, value: str | _HasHTML, /) -> te.Self:
-        if isinstance(value, str) or hasattr(value, "__html__"):
-            return self.escape(value).__add__(self)
-
-        return NotImplemented
-
-    def __mul__(self, value: t.SupportsIndex, /) -> te.Self:
-        return self.__class__(super().__mul__(value))
-
-    def __rmul__(self, value: t.SupportsIndex, /) -> te.Self:
-        return self.__class__(super().__mul__(value))
-
-    def __mod__(self, value: t.Any, /) -> te.Self:
-        if isinstance(value, tuple):
-            # a tuple of arguments, each wrapped
-            value = tuple(_MarkupEscapeHelper(x, self.escape) for x in value)
-        elif hasattr(type(value), "__getitem__") and not isinstance(value, str):
-            # a mapping of arguments, wrapped
-            value = _MarkupEscapeHelper(value, self.escape)
-        else:
-            # a single argument, wrapped with the helper and a tuple
-            value = (_MarkupEscapeHelper(value, self.escape),)
-
-        return self.__class__(super().__mod__(value))
-
-    def __repr__(self, /) -> str:
-        return f"{self.__class__.__name__}({super().__repr__()})"
-
-    def join(self, iterable: cabc.Iterable[str | _HasHTML], /) -> te.Self:
-        return self.__class__(super().join(map(self.escape, iterable)))
-
-    def split(  # type: ignore[override]
-        self, /, sep: str | None = None, maxsplit: t.SupportsIndex = -1
-    ) -> list[te.Self]:
-        return [self.__class__(v) for v in super().split(sep, maxsplit)]
-
-    def rsplit(  # type: ignore[override]
-        self, /, sep: str | None = None, maxsplit: t.SupportsIndex = -1
-    ) -> list[te.Self]:
-        return [self.__class__(v) for v in super().rsplit(sep, maxsplit)]
-
-    def splitlines(  # type: ignore[override]
-        self, /, keepends: bool = False
-    ) -> list[te.Self]:
-        return [self.__class__(v) for v in super().splitlines(keepends)]
-
-    def unescape(self, /) -> str:
-        """Convert escaped markup back into a text string. This replaces
-        HTML entities with the characters they represent.
-
-        >>> Markup("Main &raquo; <em>About</em>").unescape()
-        'Main » <em>About</em>'
-        """
-        from html import unescape
-
-        return unescape(str(self))
-
-    def striptags(self, /) -> str:
-        """:meth:`unescape` the markup, remove tags, and normalize
-        whitespace to single spaces.
-
-        >>> Markup("Main &raquo;\t<em>About</em>").striptags()
-        'Main » About'
-        """
-        value = str(self)
-
-        # Look for comments then tags separately. Otherwise, a comment that
-        # contains a tag would end early, leaving some of the comment behind.
-
-        # keep finding comment start marks
-        while (start := value.find("<!--")) != -1:
-            # find a comment end mark beyond the start, otherwise stop
-            if (end := value.find("-->", start)) == -1:
-                break
-
-            value = f"{value[:start]}{value[end + 3:]}"
-
-        # remove tags using the same method
-        while (start := value.find("<")) != -1:
-            if (end := value.find(">", start)) == -1:
-                break
-
-            value = f"{value[:start]}{value[end + 1:]}"
-
-        # collapse spaces
-        value = " ".join(value.split())
-        return self.__class__(value).unescape()
-
-    @classmethod
-    def escape(cls, s: t.Any, /) -> te.Self:
-        """Escape a string. Calls :func:`escape` and ensures that for
-        subclasses the correct type is returned.
-        """
-        rv = escape(s)
-
-        if rv.__class__ is not cls:
-            return cls(rv)
-
-        return rv  # type: ignore[return-value]
-
-    def __getitem__(self, key: t.SupportsIndex | slice, /) -> te.Self:
-        return self.__class__(super().__getitem__(key))
-
-    def capitalize(self, /) -> te.Self:
-        return self.__class__(super().capitalize())
-
-    def title(self, /) -> te.Self:
-        return self.__class__(super().title())
-
-    def lower(self, /) -> te.Self:
-        return self.__class__(super().lower())
-
-    def upper(self, /) -> te.Self:
-        return self.__class__(super().upper())
-
-    def replace(self, old: str, new: str, count: t.SupportsIndex = -1, /) -> te.Self:
-        return self.__class__(super().replace(old, self.escape(new), count))
-
-    def ljust(self, width: t.SupportsIndex, fillchar: str = " ", /) -> te.Self:
-        return self.__class__(super().ljust(width, self.escape(fillchar)))
-
-    def rjust(self, width: t.SupportsIndex, fillchar: str = " ", /) -> te.Self:
-        return self.__class__(super().rjust(width, self.escape(fillchar)))
-
-    def lstrip(self, chars: str | None = None, /) -> te.Self:
-        return self.__class__(super().lstrip(chars))
-
-    def rstrip(self, chars: str | None = None, /) -> te.Self:
-        return self.__class__(super().rstrip(chars))
-
-    def center(self, width: t.SupportsIndex, fillchar: str = " ", /) -> te.Self:
-        return self.__class__(super().center(width, self.escape(fillchar)))
-
-    def strip(self, chars: str | None = None, /) -> te.Self:
-        return self.__class__(super().strip(chars))
-
-    def translate(
-        self,
-        table: cabc.Mapping[int, str | int | None],  # type: ignore[override]
-        /,
-    ) -> str:
-        return self.__class__(super().translate(table))
-
-    def expandtabs(self, /, tabsize: t.SupportsIndex = 8) -> te.Self:
-        return self.__class__(super().expandtabs(tabsize))
-
-    def swapcase(self, /) -> te.Self:
-        return self.__class__(super().swapcase())
-
-    def zfill(self, width: t.SupportsIndex, /) -> te.Self:
-        return self.__class__(super().zfill(width))
-
-    def casefold(self, /) -> te.Self:
-        return self.__class__(super().casefold())
-
-    def removeprefix(self, prefix: str, /) -> te.Self:
-        return self.__class__(super().removeprefix(prefix))
-
-    def removesuffix(self, suffix: str) -> te.Self:
-        return self.__class__(super().removesuffix(suffix))
-
-    def partition(self, sep: str, /) -> tuple[te.Self, te.Self, te.Self]:
-        left, sep, right = super().partition(sep)
-        cls = self.__class__
-        return cls(left), cls(sep), cls(right)
-
-    def rpartition(self, sep: str, /) -> tuple[te.Self, te.Self, te.Self]:
-        left, sep, right = super().rpartition(sep)
-        cls = self.__class__
-        return cls(left), cls(sep), cls(right)
-
-    def format(self, *args: t.Any, **kwargs: t.Any) -> te.Self:
-        formatter = EscapeFormatter(self.escape)
-        return self.__class__(formatter.vformat(self, args, kwargs))
-
-    def format_map(
-        self,
-        mapping: cabc.Mapping[str, t.Any],  # type: ignore[override]
-        /,
-    ) -> te.Self:
-        formatter = EscapeFormatter(self.escape)
-        return self.__class__(formatter.vformat(self, (), mapping))
-
-    def __html_format__(self, format_spec: str, /) -> te.Self:
-        if format_spec:
-            raise ValueError("Unsupported format specification for Markup.")
-
-        return self
-
-
-class EscapeFormatter(string.Formatter):
-    __slots__ = ("escape",)
-
-    def __init__(self, escape: _TPEscape) -> None:
-        self.escape: _TPEscape = escape
-        super().__init__()
-
-    def format_field(self, value: t.Any, format_spec: str) -> str:
-        if hasattr(value, "__html_format__"):
-            rv = value.__html_format__(format_spec)
-        elif hasattr(value, "__html__"):
-            if format_spec:
-                raise ValueError(
-                    f"Format specifier {format_spec} given, but {type(value)} does not"
-                    " define __html_format__. A class that defines __html__ must define"
-                    " __html_format__ to work with format specifiers."
-                )
-            rv = value.__html__()
-        else:
-            # We need to make sure the format spec is str here as
-            # otherwise the wrong callback methods are invoked.
-            rv = super().format_field(value, str(format_spec))
-        return str(self.escape(rv))
-
-
-class _MarkupEscapeHelper:
-    """Helper for :meth:`Markup.__mod__`."""
-
-    __slots__ = ("obj", "escape")
-
-    def __init__(self, obj: t.Any, escape: _TPEscape) -> None:
-        self.obj: t.Any = obj
-        self.escape: _TPEscape = escape
-
-    def __getitem__(self, key: t.Any, /) -> te.Self:
-        return self.__class__(self.obj[key], self.escape)
-
-    def __str__(self, /) -> str:
-        return str(self.escape(self.obj))
-
-    def __repr__(self, /) -> str:
-        return str(self.escape(repr(self.obj)))
-
-    def __int__(self, /) -> int:
-        return int(self.obj)
-
-    def __float__(self, /) -> float:
-        return float(self.obj)
-
-
-def __getattr__(name: str) -> t.Any:
-    if name == "__version__":
-        import importlib.metadata
-        import warnings
-
-        warnings.warn(
-            "The '__version__' attribute is deprecated and will be removed in"
-            " MarkupSafe 3.1. Use feature detection, or"
-            ' `importlib.metadata.version("markupsafe")`, instead.',
-            stacklevel=2,
+    from distutils.command.install import install
+    from distutils.dist import Distribution
+
+    cmd: Any = install(Distribution())
+    cmd.finalize_options()
+    return (
+        cmd.exec_prefix == f"{os.path.normpath(sys.exec_prefix)}/local"
+        and cmd.prefix == f"{os.path.normpath(sys.prefix)}/local"
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _looks_like_slackware_scheme() -> bool:
+    """Slackware patches sysconfig but fails to patch distutils and site.
+
+    Slackware changes sysconfig's user scheme to use ``"lib64"`` for the lib
+    path, but does not do the same to the site module.
+    """
+    if user_site is None:  # User-site not available.
+        return False
+    try:
+        paths = sysconfig.get_paths(scheme="posix_user", expand=False)
+    except KeyError:  # User-site not available.
+        return False
+    return "/lib64/" in paths["purelib"] and "/lib64/" not in user_site
+
+
+@functools.lru_cache(maxsize=None)
+def _looks_like_msys2_mingw_scheme() -> bool:
+    """MSYS2 patches distutils and sysconfig to use a UNIX-like scheme.
+
+    However, MSYS2 incorrectly patches sysconfig ``nt`` scheme. The fix is
+    likely going to be included in their 3.10 release, so we ignore the warning.
+    See msys2/MINGW-packages#9319.
+
+    MSYS2 MINGW's patch uses lowercase ``"lib"`` instead of the usual uppercase,
+    and is missing the final ``"site-packages"``.
+    """
+    paths = sysconfig.get_paths("nt", expand=False)
+    return all(
+        "Lib" not in p and "lib" in p and not p.endswith("site-packages")
+        for p in (paths[key] for key in ("platlib", "purelib"))
+    )
+
+
+def _fix_abiflags(parts: Tuple[str]) -> Generator[str, None, None]:
+    ldversion = sysconfig.get_config_var("LDVERSION")
+    abiflags = getattr(sys, "abiflags", None)
+
+    # LDVERSION does not end with sys.abiflags. Just return the path unchanged.
+    if not ldversion or not abiflags or not ldversion.endswith(abiflags):
+        yield from parts
+        return
+
+    # Strip sys.abiflags from LDVERSION-based path components.
+    for part in parts:
+        if part.endswith(ldversion):
+            part = part[: (0 - len(abiflags))]
+        yield part
+
+
+@functools.lru_cache(maxsize=None)
+def _warn_mismatched(old: pathlib.Path, new: pathlib.Path, *, key: str) -> None:
+    issue_url = "https://github.com/pypa/pip/issues/10151"
+    message = (
+        "Value for %s does not match. Please report this to <%s>"
+        "\ndistutils: %s"
+        "\nsysconfig: %s"
+    )
+    logger.log(_MISMATCH_LEVEL, message, key, issue_url, old, new)
+
+
+def _warn_if_mismatch(old: pathlib.Path, new: pathlib.Path, *, key: str) -> bool:
+    if old == new:
+        return False
+    _warn_mismatched(old, new, key=key)
+    return True
+
+
+@functools.lru_cache(maxsize=None)
+def _log_context(
+    *,
+    user: bool = False,
+    home: Optional[str] = None,
+    root: Optional[str] = None,
+    prefix: Optional[str] = None,
+) -> None:
+    parts = [
+        "Additional context:",
+        "user = %r",
+        "home = %r",
+        "root = %r",
+        "prefix = %r",
+    ]
+
+    logger.log(_MISMATCH_LEVEL, "\n".join(parts), user, home, root, prefix)
+
+
+def get_scheme(
+    dist_name: str,
+    user: bool = False,
+    home: Optional[str] = None,
+    root: Optional[str] = None,
+    isolated: bool = False,
+    prefix: Optional[str] = None,
+) -> Scheme:
+    new = _sysconfig.get_scheme(
+        dist_name,
+        user=user,
+        home=home,
+        root=root,
+        isolated=isolated,
+        prefix=prefix,
+    )
+    if _USE_SYSCONFIG:
+        return new
+
+    old = _distutils.get_scheme(
+        dist_name,
+        user=user,
+        home=home,
+        root=root,
+        isolated=isolated,
+        prefix=prefix,
+    )
+
+    warning_contexts = []
+    for k in SCHEME_KEYS:
+        old_v = pathlib.Path(getattr(old, k))
+        new_v = pathlib.Path(getattr(new, k))
+
+        if old_v == new_v:
+            continue
+
+        # distutils incorrectly put PyPy packages under ``site-packages/python``
+        # in the ``posix_home`` scheme, but PyPy devs said they expect the
+        # directory name to be ``pypy`` instead. So we treat this as a bug fix
+        # and not warn about it. See bpo-43307 and python/cpython#24628.
+        skip_pypy_special_case = (
+            sys.implementation.name == "pypy"
+            and home is not None
+            and k in ("platlib", "purelib")
+            and old_v.parent == new_v.parent
+            and old_v.name.startswith("python")
+            and new_v.name.startswith("pypy")
         )
-        return importlib.metadata.version("markupsafe")
+        if skip_pypy_special_case:
+            continue
 
-    raise AttributeError(name)
+        # sysconfig's ``osx_framework_user`` does not include ``pythonX.Y`` in
+        # the ``include`` value, but distutils's ``headers`` does. We'll let
+        # CPython decide whether this is a bug or feature. See bpo-43948.
+        skip_osx_framework_user_special_case = (
+            user
+            and is_osx_framework()
+            and k == "headers"
+            and old_v.parent.parent == new_v.parent
+            and old_v.parent.name.startswith("python")
+        )
+        if skip_osx_framework_user_special_case:
+            continue
+
+        # On Red Hat and derived Linux distributions, distutils is patched to
+        # use "lib64" instead of "lib" for platlib.
+        if k == "platlib" and _looks_like_red_hat_lib():
+            continue
+
+        # On Python 3.9+, sysconfig's posix_user scheme sets platlib against
+        # sys.platlibdir, but distutils's unix_user incorrectly coninutes
+        # using the same $usersite for both platlib and purelib. This creates a
+        # mismatch when sys.platlibdir is not "lib".
+        skip_bpo_44860 = (
+            user
+            and k == "platlib"
+            and not WINDOWS
+            and sys.version_info >= (3, 9)
+            and _PLATLIBDIR != "lib"
+            and _looks_like_bpo_44860()
+        )
+        if skip_bpo_44860:
+            continue
+
+        # Slackware incorrectly patches posix_user to use lib64 instead of lib,
+        # but not usersite to match the location.
+        skip_slackware_user_scheme = (
+            user
+            and k in ("platlib", "purelib")
+            and not WINDOWS
+            and _looks_like_slackware_scheme()
+        )
+        if skip_slackware_user_scheme:
+            continue
+
+        # Both Debian and Red Hat patch Python to place the system site under
+        # /usr/local instead of /usr. Debian also places lib in dist-packages
+        # instead of site-packages, but the /usr/local check should cover it.
+        skip_linux_system_special_case = (
+            not (user or home or prefix or running_under_virtualenv())
+            and old_v.parts[1:3] == ("usr", "local")
+            and len(new_v.parts) > 1
+            and new_v.parts[1] == "usr"
+            and (len(new_v.parts) < 3 or new_v.parts[2] != "local")
+            and (_looks_like_red_hat_scheme() or _looks_like_debian_scheme())
+        )
+        if skip_linux_system_special_case:
+            continue
+
+        # MSYS2 MINGW's sysconfig patch does not include the "site-packages"
+        # part of the path. This is incorrect and will be fixed in MSYS.
+        skip_msys2_mingw_bug = (
+            WINDOWS and k in ("platlib", "purelib") and _looks_like_msys2_mingw_scheme()
+        )
+        if skip_msys2_mingw_bug:
+            continue
+
+        # CPython's POSIX install script invokes pip (via ensurepip) against the
+        # interpreter located in the source tree, not the install site. This
+        # triggers special logic in sysconfig that's not present in distutils.
+        # https://github.com/python/cpython/blob/8c21941ddaf/Lib/sysconfig.py#L178-L194
+        skip_cpython_build = (
+            sysconfig.is_python_build(check_home=True)
+            and not WINDOWS
+            and k in ("headers", "include", "platinclude")
+        )
+        if skip_cpython_build:
+            continue
+
+        warning_contexts.append((old_v, new_v, f"scheme.{k}"))
+
+    if not warning_contexts:
+        return old
+
+    # Check if this path mismatch is caused by distutils config files. Those
+    # files will no longer work once we switch to sysconfig, so this raises a
+    # deprecation message for them.
+    default_old = _distutils.distutils_scheme(
+        dist_name,
+        user,
+        home,
+        root,
+        isolated,
+        prefix,
+        ignore_config_files=True,
+    )
+    if any(default_old[k] != getattr(old, k) for k in SCHEME_KEYS):
+        deprecated(
+            reason=(
+                "Configuring installation scheme with distutils config files "
+                "is deprecated and will no longer work in the near future. If you "
+                "are using a Homebrew or Linuxbrew Python, please see discussion "
+                "at https://github.com/Homebrew/homebrew-core/issues/76621"
+            ),
+            replacement=None,
+            gone_in=None,
+        )
+        return old
+
+    # Post warnings about this mismatch so user can report them back.
+    for old_v, new_v, key in warning_contexts:
+        _warn_mismatched(old_v, new_v, key=key)
+    _log_context(user=user, home=home, root=root, prefix=prefix)
+
+    return old
+
+
+def get_bin_prefix() -> str:
+    new = _sysconfig.get_bin_prefix()
+    if _USE_SYSCONFIG:
+        return new
+
+    old = _distutils.get_bin_prefix()
+    if _warn_if_mismatch(pathlib.Path(old), pathlib.Path(new), key="bin_prefix"):
+        _log_context()
+    return old
+
+
+def get_bin_user() -> str:
+    return _sysconfig.get_scheme("", user=True).scripts
+
+
+def _looks_like_deb_system_dist_packages(value: str) -> bool:
+    """Check if the value is Debian's APT-controlled dist-packages.
+
+    Debian's ``distutils.sysconfig.get_python_lib()`` implementation returns the
+    default package path controlled by APT, but does not patch ``sysconfig`` to
+    do the same. This is similar to the bug worked around in ``get_scheme()``,
+    but here the default is ``deb_system`` instead of ``unix_local``. Ultimately
+    we can't do anything about this Debian bug, and this detection allows us to
+    skip the warning when needed.
+    """
+    if not _looks_like_debian_scheme():
+        return False
+    if value == "/usr/lib/python3/dist-packages":
+        return True
+    return False
+
+
+def get_purelib() -> str:
+    """Return the default pure-Python lib location."""
+    new = _sysconfig.get_purelib()
+    if _USE_SYSCONFIG:
+        return new
+
+    old = _distutils.get_purelib()
+    if _looks_like_deb_system_dist_packages(old):
+        return old
+    if _warn_if_mismatch(pathlib.Path(old), pathlib.Path(new), key="purelib"):
+        _log_context()
+    return old
+
+
+def get_platlib() -> str:
+    """Return the default platform-shared lib location."""
+    new = _sysconfig.get_platlib()
+    if _USE_SYSCONFIG:
+        return new
+
+    from . import _distutils
+
+    old = _distutils.get_platlib()
+    if _looks_like_deb_system_dist_packages(old):
+        return old
+    if _warn_if_mismatch(pathlib.Path(old), pathlib.Path(new), key="platlib"):
+        _log_context()
+    return old
